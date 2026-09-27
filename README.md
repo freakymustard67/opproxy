@@ -21,7 +21,9 @@ upstream request:
   `stream_options: {"include_usage": true}` on chat)
 * `tools` always include `read` + `bash` dummies (per-protocol format).
   Without them Zen returns
-  `403 FreeTierError: ... only ... within OpenCode`.
+  `403 FreeTierError: ... only ... within OpenCode`. Only the dummies *this
+  request actually injected* are stripped from the response, so a client that
+  ships its own `bash` or `read` tool keeps it.
 * For OpenAI Python SDK clients, `web_search`/`search_files` are aliased to
   `hermes_web_search`/`hermes_search_files` and a `strict` key is dropped —
   Zen reserves those names server-side. Other clients (omp) pass through
@@ -68,9 +70,10 @@ Unknown/paid chat models fall back to `big-pickle` with an
 ## Run
 
 ```bash
-./start.sh                           # :8787, backgrounded + verified
-python3 opproxy.py                  # :8787, anonymous, foreground
+./start.sh                           # :8787 loopback, backgrounded + verified
+python3 opproxy.py                  # :8787 loopback, anonymous, foreground
 PORT=8080 PROXY_TOKEN=secret python3 opproxy.py
+BIND=0.0.0.0 PROXY_TOKEN=secret python3 opproxy.py   # LAN (needs a token)
 ZEN_KEY=sk-... python3 opproxy.py   # BYOK instead of public
 UPSTREAM_PROXY=http://user:pass@host:3128 python3 opproxy.py  # rotating egress
 OPENCODE_ZEN_URL=https://opencode.ai/zen/v1 python3 opproxy.py
@@ -82,8 +85,9 @@ OPENCODE_ZEN_URL=https://opencode.ai/zen/v1 python3 opproxy.py
 | `ZEN_KEY` / `OPENCODE_API_KEY` | `public` | Upstream credential |
 | `PROXY_TOKEN` / `API_KEY` | _(open)_ | Require `Authorization: Bearer` on inbound requests |
 | `OPENCODE_ZEN_URL` | `https://opencode.ai/zen/v1` | Upstream base |
-| `OPENCODE_UA` | `opencode/latest/2.0.18/cli` | Upstream User-Agent |
+| `OPENCODE_UA` | `opencode/latest/2.0.14/cli` | Upstream User-Agent |
 | `UPSTREAM_PROXY` | _(direct)_ | `http(s)://` proxy for upstream egress |
+| `BIND` | `127.0.0.1` | Interface to listen on. Loopback by default: with no `PROXY_TOKEN` a wildcard bind hands your `ZEN_KEY` to the whole LAN |
 | `FALLBACK_MODEL` | `big-pickle` | Fallback for unknown chat models (empty disables) |
 | `OPENCODE_SPOOF_PROJECT_ID` | `~/.omp/install-id` | 32-hex `x-opencode-project` value |
 

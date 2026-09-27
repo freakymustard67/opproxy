@@ -15,8 +15,10 @@ Combines, from /tmp/opencode/proxies/*:
 - keelzhang/jason9075: session injection, logging
 
 Verified fingerprint (no API key, see zen_free.py):
-  Authorization: Bearer public | User-Agent: opencode/latest/2.0.18/cli
-  x-opencode-session (valid ses_ ID) | stream:true | tools include read+shell
+  Authorization: Bearer public | User-Agent: opencode/latest/2.0.14/cli
+  x-opencode-session + x-session-affinity + X-Session-Id (one ses_ id)
+  x-opencode-client: cli | x-opencode-project: <32-hex>
+  stream:true | tools include read+bash
 """
 import hashlib
 import json
@@ -73,13 +75,19 @@ DUMMY_ANT_TOOLS = [
     {"name": "read", "description": "Compatibility alias (OpenCode free-tier gate check). Prefer the native equivalent.", "input_schema": {"type": "object", "properties": {}}},
     {"name": "bash", "description": "Compatibility alias (OpenCode free-tier gate check). Prefer the native equivalent.", "input_schema": {"type": "object", "properties": {}}},
 ]
-DUMMY_NAMES = {"read", "shell", "bash"}
+DUMMY_NAMES = {"read", "shell", "bash"}   # gate pair, for docs/tests only
 
 MAX_BODY = 50 * 1024 * 1024
 TOO_LARGE = object()   # sentinel: body over MAX_BODY (distinct from bad JSON)
 
 SES_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
 PROJECT_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# Interface to bind. Loopback by default: this proxy forwards upstream with a
+# real ZEN_KEY and has no inbound auth unless PROXY_TOKEN is set, so binding
+# every interface hands the key to the whole LAN. Set BIND=0.0.0.0 to opt out
+# (only do that together with PROXY_TOKEN).
+BIND = os.environ.get("BIND", "127.0.0.1").strip() or "127.0.0.1"
 
 
 def _install_id():
@@ -162,11 +170,6 @@ def incoming_session(headers):
             return value
     return None
 
-MAX_BODY = 50 * 1024 * 1024
-TOO_LARGE = object()   # sentinel: body over MAX_BODY (distinct from bad JSON)
-
-SES_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
-
 
 def _deep_stats():
     """Snapshot counters with the nested dicts *copied*, not shared: /status
@@ -222,36 +225,45 @@ def session_for(client_ip, provided):
         return ses
 
 
+def _inject_gate_tools(tools, dummies):
+    """Append whatever gate dummies the client is missing. Returns
+    (tools, injected_names) — the names actually added by *this* call.
 
-def ensure_chat_tools(tools):
+    The injected set is what callers must filter on. Matching responses by
+    name alone (the old DUMMY_NAMES check) silently swallowed a client's own
+    `read`/`bash`/`shell` tool call: omp ships a real `bash` tool, so its calls
+    were dropped and the agent saw a text-only turn instead of running it.
+    """
     tools = list(tools or [])
     names = {n for n in (wire_tool_name(t) for t in tools) if n}
-    if "read" not in names:
-        tools.append(DUMMY_CHAT_TOOLS[0])
-    if "bash" not in names and "shell" not in names:
-        tools.append(DUMMY_CHAT_TOOLS[1])
-    return tools
+    injected = []
+    for tool, name, alt in dummies:
+        if name in names or (alt and alt in names):
+            continue
+        tools.append(tool)
+        injected.append(name)
+    return tools, injected
 
+
+def ensure_chat_tools(tools):
+    return _inject_gate_tools(tools, (
+        (DUMMY_CHAT_TOOLS[0], "read", None),
+        (DUMMY_CHAT_TOOLS[1], "bash", "shell"),
+    ))
 
 
 def ensure_resp_tools(tools):
-    tools = list(tools or [])
-    names = {n for n in (wire_tool_name(t) for t in tools) if n}
-    if "read" not in names:
-        tools.append(DUMMY_RESP_TOOLS[0])
-    if "bash" not in names and "shell" not in names:
-        tools.append(DUMMY_RESP_TOOLS[1])
-    return tools
+    return _inject_gate_tools(tools, (
+        (DUMMY_RESP_TOOLS[0], "read", None),
+        (DUMMY_RESP_TOOLS[1], "bash", "shell"),
+    ))
 
 
 def ensure_ant_tools(tools):
-    tools = list(tools or [])
-    names = {n for n in (wire_tool_name(t) for t in tools) if n}
-    if "read" not in names:
-        tools.append(DUMMY_ANT_TOOLS[0])
-    if "bash" not in names and "shell" not in names:
-        tools.append(DUMMY_ANT_TOOLS[1])
-    return tools
+    return _inject_gate_tools(tools, (
+        (DUMMY_ANT_TOOLS[0], "read", None),
+        (DUMMY_ANT_TOOLS[1], "bash", "shell"),
+    ))
 
 
 def upstream_post(path, payload, ses, stream_want, extra_headers=None):
@@ -335,6 +347,12 @@ class H(BaseHTTPRequestHandler):
             ln = int(self.headers.get("Content-Length", 0))
         except ValueError:
             ln = 0
+        if ln < 0:
+            # A negative Content-Length made rfile.read(-1) block until the
+            # peer closed: one thread pinned per request, no response ever
+            # sent. Answer 400 instead of hanging.
+            self.close_connection = True
+            return None
         if ln > MAX_BODY:
             self._drain(ln)
             return TOO_LARGE
@@ -407,9 +425,10 @@ class H(BaseHTTPRequestHandler):
         client_stream = body.get("stream", False)
         # fingerprint: force stream upstream, inject the read+bash gate pair
         alias_reserved_tools(body, self.headers.get("x-stainless-lang") == "python")
+        tools, dummies = ensure_chat_tools(body.get("tools"))
         up = dict(body, model=short, stream=True,
                   stream_options={"include_usage": True},
-                  tools=ensure_chat_tools(body.get("tools")))
+                  tools=tools)
         ses = session_for(self.client_address[0], incoming_session(self.headers))
         status, resp, err = upstream_post("/chat/completions", up, ses, True)
         if err is not None:
@@ -427,7 +446,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_header(k, v)
             self.end_headers()
             try:
-                self._relay_chat_sse(resp)
+                self._relay_chat_sse(resp, dummies)
             finally:
                 resp.close()
             stat(short, 200)
@@ -476,7 +495,7 @@ class H(BaseHTTPRequestHandler):
                 if tc.get("id"):
                     m["id"] = tc["id"]
             msg["tool_calls"] = [m for m in merged.values()
-                                 if m["function"]["name"] not in DUMMY_NAMES]
+                                 if m["function"]["name"] not in dummies]
             if not msg["tool_calls"]:
                 msg.pop("tool_calls")
         if not (msg.get("content") or "").strip() and "tool_calls" not in msg:
@@ -497,7 +516,7 @@ class H(BaseHTTPRequestHandler):
         stat(short, 200)
         return self._send(200, out, fallback_hdr)
 
-    def _relay_chat_sse(self, resp):
+    def _relay_chat_sse(self, resp, dummies=()):
         """Relay chat SSE with the gate dummy tool calls removed.
 
         The raw byte relay forwarded `read`/`shell` calls as real invocations,
@@ -506,6 +525,9 @@ class H(BaseHTTPRequestHandler):
         ones only arguments — so each index is remembered once identified.
         Zen's trailing {"choices":[],"cost":"0"} event is dropped as a side
         effect: it carries neither choices nor usage.
+
+        `dummies` is the set this request actually injected, not the global
+        DUMMY_NAMES — a client that ships its own `bash` tool must keep it.
         """
         dummy_idx, real_call = set(), False
         for raw_line in resp:
@@ -528,7 +550,7 @@ class H(BaseHTTPRequestHandler):
                         for tc in delta.get("tool_calls") or []:
                             idx = tc.get("index", 0)
                             name = (tc.get("function") or {}).get("name")
-                            if name in DUMMY_NAMES:
+                            if name in dummies:
                                 dummy_idx.add(idx)
                             elif name:
                                 real_call = True
@@ -561,8 +583,8 @@ class H(BaseHTTPRequestHandler):
                                              f"{responses_model_ids()}"})
         client_stream = body.get("stream", False)
         alias_reserved_tools(body, self.headers.get("x-stainless-lang") == "python")
-        up = dict(body, model=short, store=False, stream=True,
-                  tools=ensure_resp_tools(body.get("tools")))
+        tools, dummies = ensure_resp_tools(body.get("tools"))
+        up = dict(body, model=short, store=False, stream=True, tools=tools)
         ses = session_for(self.client_address[0], incoming_session(self.headers))
         status, resp, err = upstream_post("/responses", up, ses, True)
         if err is not None:
@@ -577,7 +599,7 @@ class H(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             try:
-                self._relay_resp_sse(resp)
+                self._relay_resp_sse(resp, dummies)
             finally:
                 resp.close()
             stat(short, 200)
@@ -609,7 +631,7 @@ class H(BaseHTTPRequestHandler):
             # strip dummy function_call items
             out = [i for i in completed.get("output", [])
                    if not (isinstance(i, dict) and i.get("type") == "function_call"
-                           and i.get("name") in DUMMY_NAMES)]
+                           and i.get("name") in dummies)]
             completed = dict(completed, output=out)
             stat(short, 200)
             return self._send(200, completed)
@@ -619,10 +641,11 @@ class H(BaseHTTPRequestHandler):
                                 "output": [{"type": "message", "role": "assistant",
                                             "content": [{"type": "output_text", "text": "".join(texts)}]}]})
 
-    def _relay_resp_sse(self, resp):
+    def _relay_resp_sse(self, resp, dummies=()):
         """Relay Responses SSE with dummy function_call items removed, keyed by
         item_id: an item is announced in response.output_item.added and carries
-        its arguments in later function_call_arguments events."""
+        its arguments in later function_call_arguments events. `dummies` is the
+        set injected for this request, so a client tool called `read` survives."""
         dummy_items = set()
         for raw_line in resp:
             line = raw_line.decode(errors="replace").rstrip("\r\n")
@@ -640,7 +663,7 @@ class H(BaseHTTPRequestHandler):
                     item = ev.get("item") or {}
                     if (ev.get("type") == "response.output_item.added"
                             and item.get("type") == "function_call"
-                            and item.get("name") in DUMMY_NAMES):
+                            and item.get("name") in dummies):
                         dummy_items.add(item.get("id"))
                         continue
                     if ev.get("item_id") in dummy_items or ev.get("id") in dummy_items:
@@ -651,7 +674,7 @@ class H(BaseHTTPRequestHandler):
                             ev = dict(ev, response=dict(obj, output=[
                                 i for i in obj["output"]
                                 if not (isinstance(i, dict) and i.get("type") == "function_call"
-                                        and i.get("name") in DUMMY_NAMES)]))
+                                        and i.get("name") in dummies)]))
                     out = f"data: {json.dumps(ev)}\n\n"
             try:
                 self.wfile.write(out.encode())
@@ -666,8 +689,8 @@ class H(BaseHTTPRequestHandler):
             stat(model, 422)
             return self._send(422, {"error": f"free models only: {chat_model_ids()}"})
         client_stream = bool(body.get("stream", False))
-        up = dict(body, model=short, stream=client_stream,
-                  tools=ensure_ant_tools(body.get("tools")))
+        tools, dummies = ensure_ant_tools(body.get("tools"))
+        up = dict(body, model=short, stream=client_stream, tools=tools)
         up.setdefault("max_tokens", 1024)
         ses = session_for(self.client_address[0], incoming_session(self.headers))
         status, resp, err = upstream_post("/messages", up, ses, client_stream, {
@@ -681,13 +704,13 @@ class H(BaseHTTPRequestHandler):
                 return self._send(status, {"error": "upstream error"})
         try:
             if client_stream:
-                self._stream_messages(resp, short)
+                self._stream_messages(resp, short, dummies)
             else:
-                self._json_messages(resp, short)
+                self._json_messages(resp, short, dummies)
         finally:
             resp.close()
 
-    def _json_messages(self, resp, short):
+    def _json_messages(self, resp, short, dummies=()):
         """Non-streaming: strip the gate dummy tool_use blocks Zen echoes back."""
         try:
             msg = json.loads(resp.read().decode(errors="replace"))
@@ -697,7 +720,7 @@ class H(BaseHTTPRequestHandler):
         if isinstance(msg, dict) and isinstance(msg.get("content"), list):
             kept = [b for b in msg["content"]
                     if not (isinstance(b, dict) and b.get("type") == "tool_use"
-                            and b.get("name") in DUMMY_NAMES)]
+                            and b.get("name") in dummies)]
             if len(kept) != len(msg["content"]):
                 msg["content"] = kept
                 if msg.get("stop_reason") == "tool_use" and not any(
@@ -706,10 +729,11 @@ class H(BaseHTTPRequestHandler):
         stat(short, 200)
         return self._send(200, msg)
 
-    def _stream_messages(self, resp, short):
+    def _stream_messages(self, resp, short, dummies=()):
         """Streaming: relay the Anthropic event stream, dropping whole dummy
         tool_use blocks (start + deltas + stop) so a gate dummy never reaches
-        the client as a real tool invocation."""
+        the client as a real tool invocation. `dummies` is the per-request
+        injected set, so a client tool named `read`/`bash` still streams."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -733,7 +757,7 @@ class H(BaseHTTPRequestHandler):
                     if kind == "content_block_start":
                         block = data.get("content_block") or {}
                         if block.get("type") == "tool_use":
-                            if block.get("name") in DUMMY_NAMES:
+                            if block.get("name") in dummies:
                                 dummy_idx.add(data.get("index"))
                                 continue
                             real_tool_use = True
@@ -756,29 +780,43 @@ class Server(ThreadingHTTPServer):
     """Dual-stack, so `localhost` works whichever family the client resolves
     first. A client configured with http://localhost:PORT got connection
     refused on ::1 when the proxy only listened on IPv4."""
+
     daemon_threads = True
     address_family = socket.AF_INET6
     allow_reuse_address = True
 
     def server_bind(self):
-        try:
-            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        except OSError:
-            pass
+        if self.address_family == socket.AF_INET6:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
         return super().server_bind()
 
 
 def build_server(port):
+    """Bind BIND (loopback unless overridden). AF_INET6 is only used for a
+    wildcard/:: bind — a v6-only socket on 127.0.0.1 would refuse IPv4 clients."""
+    v6 = BIND in ("::", "::0", "")
     try:
-        return Server(("::", port), H)
+        if v6:
+            return Server((BIND, port), H)
+        return ThreadingHTTPServer((BIND, port), H)   # AF_INET, honours BIND
     except OSError:      # host without IPv6
-        return ThreadingHTTPServer(("0.0.0.0", port), H)
+        if v6:
+            return ThreadingHTTPServer(("127.0.0.1", port), H)
+        raise
 
 
 if __name__ == "__main__":
     srv = build_server(PORT)
-    print(f"opproxy on :{PORT} (localhost + 127.0.0.1) upstream={UPSTREAM} "
+    print(f"opproxy on {BIND}:{PORT} upstream={UPSTREAM} "
           f"auth={'BYOK' if ZEN_KEY != 'public' else 'public-anon'} "
+          f"inbound={'token' if PROXY_TOKEN else 'OPEN'} "
           f"project={project_id() or 'unset'} "
           f"proxy={'rotating-egress' if UPSTREAM_PROXY else 'direct'}", flush=True)
+    if not PROXY_TOKEN and BIND not in ("127.0.0.1", "::1", "localhost"):
+        print(f"WARNING: no PROXY_TOKEN and bound to {BIND} — anyone who can "
+              f"reach {BIND}:{PORT} can spend this ZEN_KEY. Set PROXY_TOKEN, "
+              f"or unset BIND to fall back to loopback.", flush=True)
     srv.serve_forever()
