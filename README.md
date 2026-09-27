@@ -96,7 +96,7 @@ providers:
 export OPPROXY_KEY=dummy
 omp -p --model opproxy/big-pickle "say ok"
 
-# hermes — ~/.hermes/config.yaml (v12+ `providers:` map)
+# hermes — ~/.hermes/config.yaml: a `providers:` entry, then point model.* at it
 providers:
   opproxy:
     base_url: http://127.0.0.1:8787/v1
@@ -104,15 +104,33 @@ providers:
     api_mode: chat_completions
     default_model: big-pickle
     discover_models: true
-hermes -z "say ok" --provider opproxy -m big-pickle
+model:
+  provider: opproxy
+  default: big-pickle
+  base_url: http://127.0.0.1:8787/v1
+  api_mode: chat_completions
+
+hermes config set model.provider opproxy
+hermes config set model.default big-pickle
+hermes config set model.base_url http://127.0.0.1:8787/v1
+hermes config set model.api_mode chat_completions
+hermes -z "say ok"
+
 
 # opencode (v2 config)
 # { "providers": { "local": { "package": "@opencode-ai/ai/providers/openai-compatible",
 #   "settings": {"baseURL": "http://127.0.0.1:8787/v1"}, ... } } }
 ```
 
-Verified with `omp` (plain reply + file-write task) and `hermes`
-(plain reply + file-write task) against `big-pickle`.
+Verified with `omp` (plain reply + file-write task) and `hermes` against
+`big-pickle`: a one-shot reply, and a tool-using turn that ran the agent loop
+to completion (6 API calls, `failed: false`, `finish_reason=stop`). Because
+hermes sends tools on every turn, the streamed dummy `read`/`shell` calls must
+be filtered for it to work at all — see the streaming notes above.
+
+`discover_models: true` makes hermes enumerate `/v1/models`, which also lists
+the two `/v1/responses` models; it tries them on `/v1/chat/completions`, gets
+the `400` cross-protocol hint, and moves on.
 
 `zen_free.py` is the minimal standalone client proving the gate
 (`chat` and `responses` modes, no proxy needed).
