@@ -62,6 +62,9 @@ DUMMY_ANT_TOOLS = [
 ]
 DUMMY_NAMES = {"read", "shell", "bash"}
 
+MAX_BODY = 50 * 1024 * 1024
+TOO_LARGE = object()   # sentinel: body over MAX_BODY (distinct from bad JSON)
+
 SES_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
 
 
@@ -211,18 +214,32 @@ class H(BaseHTTPRequestHandler):
             got = got[7:]
         return secrets.compare_digest(got, PROXY_TOKEN)
 
+    def _drain(self, n):
+        """Consume an oversized body before replying. Answering 413 and closing
+        mid-upload makes the client fail on a broken pipe instead of reading
+        the status, so the bytes are swallowed (bounded) first."""
+        left = min(n, 128 * 1024 * 1024)
+        while left > 0:
+            chunk = self.rfile.read(min(left, 1 << 20))
+            if not chunk:
+                break
+            left -= len(chunk)
+        self.close_connection = True
+
     def _body(self):
         try:
             ln = int(self.headers.get("Content-Length", 0))
         except ValueError:
             ln = 0
-        if ln > 50 * 1024 * 1024:
-            return None
+        if ln > MAX_BODY:
+            self._drain(ln)
+            return TOO_LARGE
         raw = self.rfile.read(ln) if ln else b"{}"
         try:
             return json.loads(raw.decode())
         except (ValueError, UnicodeDecodeError):
             return None
+
 
     def do_GET(self):
         if self.path == "/health":
@@ -242,6 +259,8 @@ class H(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return self._send(401, {"error": "bad proxy key"})
         body = self._body()
+        if body is TOO_LARGE:
+            return self._send(413, {"error": "request body too large"})
         if body is None:
             return self._send(400, {"error": "invalid json"})
         if self.path == "/v1/chat/completions":

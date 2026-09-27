@@ -24,6 +24,8 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from zen_models import chat_model_ids, short_name
+
 
 UPSTREAM = os.environ.get("OPENCODE_ZEN_URL", "https://opencode.ai/zen/v1")
 ZEN_KEY = os.environ.get("ZEN_KEY") or os.environ.get("OPENCODE_API_KEY") or "public"
@@ -31,15 +33,12 @@ PROXY_TOKEN = os.environ.get("PROXY_TOKEN") or os.environ.get("API_KEY") or ""
 PORT = int(os.environ.get("PORT", "8788"))
 UA = os.environ.get("OPENCODE_UA", "opencode/latest/2.0.18/cli")
 
-CHAT_MODELS = [
-    "big-pickle", "space-bunny-free", "longcat-2.5-preview-free",
-    "mimo-v2.6-flash-free", "mimo-v2.5-free", "mimo-v2-pro-free",
-    "ling-3.0-flash-fin-free", "nemotron-3-ultra-free",
-    "nemotron-3.5-lightning-free", "deepseek-v4-flash-free",
-    "kimi-k2.5-free", "glm-5-free",
-]
+CHAT_MODELS = chat_model_ids()
+
 
 DUMMY_NAMES = {"read", "shell", "bash"}
+
+MAX_BODY = 50 * 1024 * 1024
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
@@ -110,6 +109,18 @@ class H(BaseHTTPRequestHandler):
             got = got[7:]
         return secrets.compare_digest(got, PROXY_TOKEN)
 
+    def _drain(self, n):
+        """Swallow an oversized body before replying 413; closing mid-upload
+        makes the client report a broken pipe instead of the status."""
+        left = min(n, 128 * 1024 * 1024)
+        while left > 0:
+            chunk = self.rfile.read(min(left, 1 << 20))
+            if not chunk:
+                break
+            left -= len(chunk)
+        self.close_connection = True
+
+
     def do_GET(self):
         if self.path == "/health":
             return self._send(200, {"status": "ok"})
@@ -128,13 +139,14 @@ class H(BaseHTTPRequestHandler):
             ln = int(self.headers.get("Content-Length", 0))
         except ValueError:
             ln = 0
+        if ln > MAX_BODY:
+            self._drain(ln)
+            return self._send(413, {"error": "request body too large"})
         try:
             body = json.loads(self.rfile.read(ln).decode() if ln else "{}")
         except (ValueError, UnicodeDecodeError):
             return self._send(400, {"error": "invalid json"})
-        model = str(body.get("model", "")).split("/")[-1].split(":")[0]
-        if model not in CHAT_MODELS:
-            return self._send(422, {"error": f"free chat models only: {CHAT_MODELS}"})
+        model = short_name(body.get("model", ""))
         client_stream = bool(body.get("stream", False))
         client_tools = body.get("tools") or []
         base_up = dict(body, model=model, stream=True,
@@ -146,32 +158,47 @@ class H(BaseHTTPRequestHandler):
             base_up["tool_choice"] = "none"
         if client_tools:
             return self._passthrough(base_up, model, client_stream)
-        # No-tool clients: aggregate (with retries on dummy-only calls),
-        # then answer JSON or re-emit clean SSE. This avoids leaking
-        # reasoning/name/dummy-call deltas to plain OpenAI clients.
-        text, usage, finish = "", None, None
+        # No-tool clients: aggregate (retrying while Zen keeps reaching for the
+        # gate dummies), then answer JSON or re-emit clean SSE. This avoids
+        # leaking reasoning/name/dummy-call deltas to plain OpenAI clients.
+        text, usage, finish, calls = "", None, None, []
         for _ in range(3):
             status, resp, err = self._upstream(base_up)
             if err is not None:
-                try:
-                    return self._send(status, json.loads(err.decode()))
-                except ValueError:
-                    return self._send(status, {"error": "upstream error"})
-            text, usage, finish = self._aggregate(resp)
+                return self._upstream_error(status, err)
+            text, usage, finish, calls = self._aggregate(resp)
             resp.close()
-            if text.strip():
+            if text.strip() or calls:
                 break
-            base_up = dict(base_up)  # fresh ses below; new upstream sample
-        if finish == "tool_calls":
-            finish = "stop"
+        if not text.strip() and not calls:
+            # Three samples, nothing but dummy tool calls. Answering 200 with an
+            # empty message is indistinguishable from a legitimately empty
+            # answer, so the client just stores a blank summary.
+            return self._send(502, {"error": {
+                "type": "empty_upstream_response",
+                "message": "no content and no tool call in 3 attempts (dummy tool calls only)"}})
+        # Dummy tool calls are stripped, so upstream's tool_calls finish would
+        # otherwise reach the client with no tool_calls to show for it.
+        finish = "tool_calls" if calls else ("stop" if finish == "tool_calls" else finish)
         if not client_stream:
-            return self._send(200, {
-                "id": f"chatcmpl-{secrets.token_hex(8)}", "object": "chat.completion",
-                "created": int(time.time()), "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                             "finish_reason": finish or "stop"}],
-                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
-        return self._emit_text_stream(model, text, usage, finish or "stop")
+            return self._send(200, self._completion(model, text, usage, finish, calls))
+        return self._emit_text_stream(model, text, usage, finish or "stop", calls)
+
+    def _completion(self, model, text, usage, finish, calls):
+        msg = {"role": "assistant", "content": text or None}
+        if calls:
+            msg["tool_calls"] = calls
+        return {
+            "id": f"chatcmpl-{secrets.token_hex(8)}", "object": "chat.completion",
+            "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish or "stop"}],
+            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+    def _upstream_error(self, status, err):
+        try:
+            return self._send(status, json.loads(err.decode()))
+        except ValueError:
+            return self._send(status, {"error": "upstream error"})
 
     def _upstream(self, up):
         req = urllib.request.Request(
@@ -187,31 +214,48 @@ class H(BaseHTTPRequestHandler):
             return 200, resp, None
         except urllib.error.HTTPError as e:
             return e.code, None, e.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            return 502, None, json.dumps({"error": {"type": "upstream_unavailable",
+                                                   "message": str(e)[:200]}}).encode()
 
-    def _emit_text_stream(self, model, text, usage, finish):
+    def _emit_text_stream(self, model, text, usage, finish, calls=()):
+        cid, created = f"chatcmpl-{secrets.token_hex(8)}", int(time.time())
+
+        def chunk(delta, fin=None):
+            return f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk',
+                                        'created': created, 'model': model,
+                                        'choices': [{'index': 0, 'delta': delta,
+                                                     'finish_reason': fin}]})}\n\n"
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
-        cid, created = f"chatcmpl-{secrets.token_hex(8)}", int(time.time())
         try:
-            self.wfile.write(f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n".encode())
+            self.wfile.write(chunk({"role": "assistant"}).encode())
             for i in range(0, len(text), 2000):
-                self.wfile.write(f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': text[i:i + 2000]}, 'finish_reason': None}]})}\n\n".encode())
-            self.wfile.write(f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]})}\n\n".encode())
-            if usage:
-                self.wfile.write(f"data: {json.dumps({'usage': usage})}\n\n".encode())
+                self.wfile.write(chunk({"content": text[i:i + 2000]}).encode())
+            for tc in calls or ():
+                self.wfile.write(chunk({"tool_calls": [tc]}).encode())
+            self.wfile.write(chunk({}, finish).encode())
+            self.wfile.write(self._usage_event(cid, created, model, usage).encode())
             self.wfile.write(b"data: [DONE]\n\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _usage_event(self, cid, created, model, usage):
+        """OpenAI sends id/object/choices alongside the final usage chunk;
+        a bare {"usage": …} is what sanitizing accidentally produced."""
+        if not usage:
+            return b""
+        return f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk',
+                                    'created': created, 'model': model, 'choices': [],
+                                    'usage': usage})}\n\n".encode()
+
     def _passthrough(self, up, model, client_stream):
         status, resp, err = self._upstream(up)
         if err is not None:
-            try:
-                return self._send(status, json.loads(err.decode()))
-            except ValueError:
-                return self._send(status, {"error": "upstream error"})
+            return self._upstream_error(status, err)
         if client_stream:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -222,16 +266,11 @@ class H(BaseHTTPRequestHandler):
             finally:
                 resp.close()
             return
-        text, usage, finish = self._aggregate(resp)
+        text, usage, finish, calls = self._aggregate(resp)
         resp.close()
-        if finish == "tool_calls":
-            finish = "stop"
-        return self._send(200, {
-            "id": f"chatcmpl-{secrets.token_hex(8)}", "object": "chat.completion",
-            "created": int(time.time()), "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": finish or "stop"}],
-            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+        return self._send(200, self._completion(
+            model, text, usage,
+            "tool_calls" if calls else ("stop" if finish == "tool_calls" else finish), calls))
 
     def _events(self, resp):
         buf = b""
@@ -257,7 +296,16 @@ class H(BaseHTTPRequestHandler):
 
     def _relay_stream(self, resp):
         saw_real_call = False
+        cid = created = model = None
         for ev in self._events(resp):
+            if cid is None:
+                # One identity for the whole stream: the old inline
+                # `ev.get("id", f"chatcmpl-{token_hex(8)}")` minted a *new* id
+                # for every chunk whenever upstream omitted one, which splits
+                # a single completion into several on the client.
+                cid = ev.get("id") or f"chatcmpl-{secrets.token_hex(8)}"
+                created = ev.get("created") or int(time.time())
+                model = ev.get("model", "")
             for ch in ev.get("choices", []):
                 finish = ch.get("finish_reason")
                 delta = clean_delta(ch.get("delta", {}))
@@ -270,10 +318,8 @@ class H(BaseHTTPRequestHandler):
                 elif finish == "tool_calls" and not saw_real_call:
                     # Dummy-only calls were stripped; report clean stop.
                     finish = "stop"
-                out = {"id": ev.get("id", f"chatcmpl-{secrets.token_hex(8)}"),
-                       "object": "chat.completion.chunk",
-                       "created": ev.get("created", int(time.time())),
-                       "model": ev.get("model", ""),
+                out = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": model,
                        "choices": [{"index": ch.get("index", 0), "delta": delta,
                                     "finish_reason": finish}]}
                 try:
@@ -282,8 +328,7 @@ class H(BaseHTTPRequestHandler):
                     return
             if ev.get("usage"):
                 try:
-                    self.wfile.write(
-                        f"data: {json.dumps({'usage': ev['usage']})}\n\n".encode())
+                    self.wfile.write(self._usage_event(cid, created, model, ev["usage"]))
                 except (BrokenPipeError, ConnectionResetError):
                     return
         try:
@@ -292,6 +337,10 @@ class H(BaseHTTPRequestHandler):
             pass
 
     def _aggregate(self, resp):
+        """Text, usage, finish reason and the real tool calls, with the gate
+        dummies removed. Non-dummy calls used to be replaced by an injected
+        "[tool_call filtered: …]" sentence, which a client cannot tell apart
+        from model output."""
         text, usage, finish = "", None, None
         pending = {}
         for ev in self._events(resp):
@@ -301,23 +350,25 @@ class H(BaseHTTPRequestHandler):
                     text += d["content"]
                 for tc in d.get("tool_calls", []) or []:
                     idx = tc.get("index", 0)
-                    m = pending.setdefault(idx, {"name": "", "args": ""})
+                    m = pending.setdefault(idx, {"id": "", "type": "function",
+                                                 "function": {"name": "", "arguments": ""}})
                     f = tc.get("function", {})
+                    if tc.get("id"):
+                        m["id"] = tc["id"]
                     if f.get("name"):
-                        m["name"] = f["name"]
+                        m["function"]["name"] = f["name"]
                     if f.get("arguments"):
-                        m["args"] += f["arguments"]
+                        m["function"]["arguments"] += f["arguments"]
                 if ch.get("finish_reason"):
                     finish = ch["finish_reason"]
             if ev.get("usage"):
                 usage = ev["usage"]
-        # Any non-dummy tool call would need real execution; for a summarizer
-        # surface it explicitly instead of silently dropping it.
-        real = [(i, m) for i, m in pending.items() if m["name"] not in DUMMY_NAMES and m["name"]]
-        if real:
-            text += "\n\n[tool_call filtered: " + ", ".join(
-                f"{m['name']}" for _, m in real) + " — resend via a harness proxy]"
-        return text, usage, finish
+        calls = [{"id": m["id"] or f"call_{secrets.token_hex(8)}", "type": "function",
+                  "function": {"name": m["function"]["name"],
+                               "arguments": m["function"]["arguments"] or "{}"}}
+                 for _, m in sorted(pending.items())
+                 if m["function"]["name"] and m["function"]["name"] not in DUMMY_NAMES]
+        return text, usage, finish, calls
 
 
 if __name__ == "__main__":
