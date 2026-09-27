@@ -313,14 +313,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_header(k, v)
             self.end_headers()
             try:
-                while True:
-                    chunk = resp.read(32768)
-                    if not chunk:
-                        break
-                    try:
-                        self.wfile.write(chunk)
-                    except (BrokenPipeError, ConnectionResetError):
-                        break
+                self._relay_chat_sse(resp)
             finally:
                 resp.close()
             stat(short, 200)
@@ -379,6 +372,60 @@ class H(BaseHTTPRequestHandler):
         stat(short, 200)
         return self._send(200, out, fallback_hdr)
 
+    def _relay_chat_sse(self, resp):
+        """Relay chat SSE with the gate dummy tool calls removed.
+
+        The raw byte relay forwarded `read`/`shell` calls as real invocations,
+        so a tool-using client (hermes, omp) tried to execute them. Tool-call
+        deltas are fragmented — the first fragment carries the name, later
+        ones only arguments — so each index is remembered once identified.
+        Zen's trailing {"choices":[],"cost":"0"} event is dropped as a side
+        effect: it carries neither choices nor usage.
+        """
+        dummy_idx, real_call = set(), False
+        for raw_line in resp:
+            line = raw_line.decode(errors="replace").rstrip("\r\n")
+            if not line.startswith("data:"):
+                out = line + "\n"
+            else:
+                payload = line[5:].strip()
+                try:
+                    ev = json.loads(payload) if payload and payload != "[DONE]" else None
+                except ValueError:
+                    ev = None
+                if ev is None:
+                    out = line + "\n"
+                else:
+                    choices = ev.get("choices") or []
+                    for ch in choices:
+                        delta = ch.get("delta") or {}
+                        kept = []
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            name = (tc.get("function") or {}).get("name")
+                            if name in DUMMY_NAMES:
+                                dummy_idx.add(idx)
+                            elif name:
+                                real_call = True
+                            if idx not in dummy_idx:
+                                kept.append(tc)
+                        if delta.get("tool_calls"):
+                            if kept:
+                                delta["tool_calls"] = kept
+                            else:
+                                delta.pop("tool_calls")
+                        if ch.get("finish_reason") == "tool_calls" and not real_call:
+                            ch["finish_reason"] = "stop"
+                    if not ev.get("usage") and not any(
+                            (ch.get("delta") or ch.get("finish_reason")) for ch in choices):
+                        continue
+                    out = f"data: {json.dumps(ev)}\n\n"
+            try:
+                self.wfile.write(out.encode())
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+
     # ---- /v1/responses (OpenAI Responses) ----
     def handle_responses(self, body):
         model = body.get("model", "")
@@ -404,14 +451,7 @@ class H(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             try:
-                while True:
-                    chunk = resp.read(32768)
-                    if not chunk:
-                        break
-                    try:
-                        self.wfile.write(chunk)
-                    except (BrokenPipeError, ConnectionResetError):
-                        break
+                self._relay_resp_sse(resp)
             finally:
                 resp.close()
             stat(short, 200)
@@ -452,6 +492,45 @@ class H(BaseHTTPRequestHandler):
                                 "status": "completed", "model": short,
                                 "output": [{"type": "message", "role": "assistant",
                                             "content": [{"type": "output_text", "text": "".join(texts)}]}]})
+
+    def _relay_resp_sse(self, resp):
+        """Relay Responses SSE with dummy function_call items removed, keyed by
+        item_id: an item is announced in response.output_item.added and carries
+        its arguments in later function_call_arguments events."""
+        dummy_items = set()
+        for raw_line in resp:
+            line = raw_line.decode(errors="replace").rstrip("\r\n")
+            if not line.startswith("data:"):
+                out = line + "\n"
+            else:
+                payload = line[5:].strip()
+                try:
+                    ev = json.loads(payload) if payload and payload != "[DONE]" else None
+                except ValueError:
+                    ev = None
+                if ev is None:
+                    out = line + "\n"
+                else:
+                    item = ev.get("item") or {}
+                    if (ev.get("type") == "response.output_item.added"
+                            and item.get("type") == "function_call"
+                            and item.get("name") in DUMMY_NAMES):
+                        dummy_items.add(item.get("id"))
+                        continue
+                    if ev.get("item_id") in dummy_items or ev.get("id") in dummy_items:
+                        continue
+                    if ev.get("type") == "response.completed":
+                        obj = ev.get("response")
+                        if isinstance(obj, dict) and isinstance(obj.get("output"), list):
+                            ev = dict(ev, response=dict(obj, output=[
+                                i for i in obj["output"]
+                                if not (isinstance(i, dict) and i.get("type") == "function_call"
+                                        and i.get("name") in DUMMY_NAMES)]))
+                    out = f"data: {json.dumps(ev)}\n\n"
+            try:
+                self.wfile.write(out.encode())
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     # ---- /v1/messages (Anthropic native passthrough, beta) ----
     def handle_messages(self, body):
