@@ -103,7 +103,17 @@ providers:
     auth: none            # proxy needs no key; use key_env if PROXY_TOKEN is set
     api_mode: chat_completions
     default_model: big-pickle
-    discover_models: true
+    discover_models: false   # the list below is the allowlist; see note
+    context_length: 200000
+    models:                  # chat models only — the /v1/responses ones
+      - big-pickle           # cannot be called on /v1/chat/completions
+      - space-bunny-free
+      - longcat-2.5-preview-free
+      - mimo-v2.6-flash-free
+      - mimo-v2.5-free
+      - ling-3.0-flash-fin-free
+      - nemotron-3-ultra-free
+      - nemotron-3.5-lightning-free
 model:
   provider: opproxy
   default: big-pickle
