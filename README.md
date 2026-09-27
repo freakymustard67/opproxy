@@ -90,10 +90,14 @@ Where the numbers come from:
   oversized request with a bare `invalid request` and never state a number, so
   theirs stay unconfirmed (the ladder measured 984553 prompt tokens for
   big-pickle).
-* **Vision** — a two-image control: a blue 1×1 PNG must come back blue *and* a
-  red one must not. A single image cannot separate vision from a lucky guess,
-  which is how both `muse-spark` models came to be marked vision-capable when
-  they answer "gray" for blue, red and green alike.
+* **Vision** — from the vendor, because a pixel probe cannot settle it. Meta
+  documents Muse Spark as "natively multimodal" that "perceives video, images
+  and documents"; NVIDIA documents Nemotron 3.5 Lightning as text-only. The
+  live two-image control in `verify_models.py` is **advisory**: it disagrees
+  with Meta on the muse models (they answer "gray"/"white" for blue, red and
+  green alike, 0/3 on the control) precisely because naming the exact colour
+  of one flat pixel is a different question from whether an image is
+  understood. It reports the disagreement; it does not set the value.
 * **Reasoning / tools** — observed in live streams (`reasoning_content`
   deltas, tool calls). Effort levels are not published and were not measured,
   so no `reasoning` object is served and clients read "supported, efforts

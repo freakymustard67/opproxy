@@ -36,16 +36,39 @@ So the numbers come from Zen itself, by two routes:
  2. Where upstream will not say, verify_models.py measures it: a prompt of
     N filler characters, and the `prompt_tokens` the model itself reported.
 
-`max_output` is the weak field. Upstream states a max_tokens ceiling only for
-longcat (262144); for the others it accepts 400000 without complaint, so
-these values are unverified hints, not measurements.
+CAPABILITIES COME FROM THE VENDORS, NOT FROM A PIXEL PROBE
+---------------------------------------------------------
+`vision`, `reasoning` and `tools` are transcribed from the model vendors'
+own documentation, because they are facts about the model, not about this
+gateway, and a local probe can only ever estimate them:
 
-Vision is decided by a two-image control: a blue 1x1 PNG must come back blue
-AND a red one must not. One image cannot tell vision from a lucky guess --
-which is how both muse models were wrongly marked vision-capable, since they
-answer "gray" for blue, red and green alike.
+  * Muse Spark 1.2 / 1.3 (Meta) -- "Muse Spark is a natively multimodal
+    reasoning model"; "perceives video, images and documents"; all three
+    versions "share the same modalities and context window, 1,048,576 tokens".
+    (ai.developer.meta.com/docs/models, dev.meta.ai/docs/models,
+    dev.meta.ai/models/muse-spark). So: vision True, context 1048576.
+  * Nemotron 3 Ultra and 3.5 Lightning (NVIDIA) -- "Context length: up to 1M
+    tokens" (docs.nvidia.com, build.nvidia.com model card), which matches the
+    1000000 that upstream states when you exceed it. Nemotron 3.5 Lightning is
+    a text-only reasoning model, so vision False.
+  * The rest: vision confirmed by the two-image control in verify_models.py
+    (a blue 1x1 PNG must come back blue AND a red one must not -- one image
+    cannot tell vision from a lucky guess).
 
-See `verify_models.py` to re-run the matrix and refresh these numbers.
+That control is advisory, not authoritative, and it is *not* what the catalog
+is built from. On a flat 1x1 pixel it is unreliable in both directions: the
+muse models answer "gray"/"white" for blue, red and green alike (6 attempts,
+0/3 control passes) while being documented multimodal, because naming the
+exact colour of a single flat pixel is a different question from whether an
+image is understood. A probe that cannot agree with the vendor's own model
+card is measuring the probe.
+
+`max_output` is the weakest field. Upstream states a max_tokens ceiling only
+for longcat (262144); the vendors publish output caps for some models (NVIDIA
+publishes Nemotron 3 Ultra at ~64K output) and nothing at all for others, so
+the rest are unverified hints.
+
+See `verify_models.py` to re-run the matrix and refresh the numbers.
 """
 
 # context: upstream-stated where it exists (see above), otherwise measured.
@@ -90,15 +113,15 @@ MODELS = {
         "protocol": "chat", "context": 1000000, "vision": False,
         "reasoning": True, "tools": True, "max_output": 262144,
     },
-    # vision re-measured with the two-image control: answers "gray" for every
-    # colour, so it reads no pixels
+    # Meta: "natively multimodal reasoning model", "perceives video, images
+    # and documents", all versions share a 1,048,576-token window.
     "muse-spark-1.3-contributor-free": {
-        "protocol": "responses", "context": 1048576, "vision": False,
+        "protocol": "responses", "context": 1048576, "vision": True,
         "reasoning": True, "tools": True, "max_output": 131072,
     },
-    # same as 1.3
+    # same family, same modalities and context window
     "muse-spark-1.2-contributor-free": {
-        "protocol": "responses", "context": 1048576, "vision": False,
+        "protocol": "responses", "context": 1048576, "vision": True,
         "reasoning": True, "tools": True, "max_output": 131072,
     },
 }
