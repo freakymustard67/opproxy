@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from zen_models import MODELS, chat_model_ids, responses_model_ids, short_name
+from zen_models import MODELS, chat_model_ids, responses_model_ids, short_name, model_info
 
 
 UPSTREAM = os.environ.get("OPENCODE_ZEN_URL", "https://opencode.ai/zen/v1")
@@ -372,8 +372,7 @@ class H(BaseHTTPRequestHandler):
             s["uptime"] = int(time.time() - s.pop("started"))
             return self._send(200, s)
         if self.path in ("/v1/models", "/v1/models/"):
-            data = [{"id": m, "object": "model", "owned_by": "opencode-zen",
-                     "context_window": v["context"]} for m, v in MODELS.items()]
+            data = [model_info(m) for m in MODELS]
             return self._send(200, {"object": "list", "data": data})
         return self._send(404, {"error": "not found"})
 

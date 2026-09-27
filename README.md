@@ -67,6 +67,50 @@ cannot speak the Anthropic wire format returns its own `401 ModelError`.
 Unknown/paid chat models fall back to `big-pickle` with an
 `x-model-fallback` response header (disable with `FALLBACK_MODEL=`).
 
+### Model metadata
+
+Zen publishes none: `/v1/models` returns bare ids (`id`, `object`, `created`,
+`owned_by`) and every sibling endpoint — `/v1/models/<id>`, `/models.json`,
+`/config.json`, `/provider/models`, `/catalog`, `/capabilities` — is a 404.
+So `/v1/models` here serves what the proxy *measured*, in the three shapes
+clients already parse:
+
+| shape | fields | read by |
+|---|---|---|
+| OpenAI | `id`, `object`, `created`, `owned_by` | everything |
+| models.dev | `limit.{context,output}`, `modalities`, `reasoning`, `tool_call`, `cost` | opencode, hermes `agent/models_dev.py` |
+| OpenRouter | `supported_parameters`, `context_length`, `architecture.input_modalities`, `top_provider.max_completion_tokens` | hermes `models_reasoning_caps.py` |
+| convenience | `context_window`, `capabilities.{vision,reasoning,tools}`, `limits` | whatever read this proxy before |
+
+Where the numbers come from:
+
+* **Context** — upstream states it outright when you exceed it, so the catalog
+  quotes the error: `"This endpoint's maximum context length is 1048576
+  tokens"`, `262144`, `1000000`. `big-pickle` and `space-bunny-free` reject an
+  oversized request with a bare `invalid request` and never state a number, so
+  theirs stay unconfirmed (the ladder measured 984553 prompt tokens for
+  big-pickle).
+* **Vision** — a two-image control: a blue 1×1 PNG must come back blue *and* a
+  red one must not. A single image cannot separate vision from a lucky guess,
+  which is how both `muse-spark` models came to be marked vision-capable when
+  they answer "gray" for blue, red and green alike.
+* **Reasoning / tools** — observed in live streams (`reasoning_content`
+  deltas, tool calls). Effort levels are not published and were not measured,
+  so no `reasoning` object is served and clients read "supported, efforts
+  unknown".
+* **`max_output`** — the weakest field. Upstream states a `max_tokens` ceiling
+  only for `longcat` (262144) and accepts 400000 on the others without
+  complaint, so those values are unverified hints.
+
+Refresh any of it against the live gateway:
+
+```bash
+python3 verify_models.py --vision --check   # cheap, exits 1 on drift
+python3 verify_models.py                    # adds the slow context ladder
+```
+
+Set `VERIFY_DEBUG=1` to see upstream error bodies instead of silent failures.
+
 ## Run
 
 ```bash

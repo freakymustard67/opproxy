@@ -10,23 +10,97 @@ responses (/responses); Zen's /messages endpoint is not a separate model
 family -- it serves whichever models accept the Anthropic wire format (today
 only space-bunny-free), so `protocol` never claims it.
 
-Context windows are inherited from the original models.dev-derived table and
-are NOT verified: a 250k-token prompt was accepted by every chat model here
-and rejected by big-pickle at ~1M tokens, but that 400 is ambiguous (upstream
-also rejects oversized bodies), so the legacy numbers are kept as-is rather
-than invented. Treat them as hints.
+CONTEXT AND CAPABILITY NUMBERS ARE MEASURED, NOT COPIED
+------------------------------------------------------
+Zen's public API publishes no model metadata: /v1/models returns bare ids
+(verified -- no `context`, `capabilities` or `modalities` keys), and
+/v1/models/<id>, /models.json, /config.json, /provider/models, /catalog and
+/capabilities are all 404. Third-party sources are not trustworthy here
+either: models.dev lists big-pickle at 200000 (it accepted 933768 real prompt
+tokens) and marks mimo-v2.5-free deprecated while Zen still serves it.
+
+So the numbers come from Zen itself, by two routes:
+
+ 1. Upstream states the limit when you exceed it. Asking for
+    max_tokens=3_000_000 returns, verbatim:
+      "This endpoint's maximum context length is 1048576 tokens"      (mimo)
+      "This endpoint's maximum context length is 262144 tokens"       (ling)
+      "This endpoint's maximum context length is 1000000 tokens"      (nemotron)
+      "/max_tokens: 3000000 is not less or equal to 262144"           (longcat)
+    Those are quoted straight from the error, so they beat any inference.
+    big-pickle and space-bunny-free reject an oversized max_tokens with a
+    bare "invalid request" and never state a number, so theirs stay
+    unconfirmed; the ladder measured 984553 prompt tokens for big-pickle,
+    which is consistent with a 1048576 window that a body-size ceiling
+    reaches first.
+ 2. Where upstream will not say, verify_models.py measures it: a prompt of
+    N filler characters, and the `prompt_tokens` the model itself reported.
+
+`max_output` is the weak field. Upstream states a max_tokens ceiling only for
+longcat (262144); for the others it accepts 400000 without complaint, so
+these values are unverified hints, not measurements.
+
+Vision is decided by a two-image control: a blue 1x1 PNG must come back blue
+AND a red one must not. One image cannot tell vision from a lucky guess --
+which is how both muse models were wrongly marked vision-capable, since they
+answer "gray" for blue, red and green alike.
+
+See `verify_models.py` to re-run the matrix and refresh these numbers.
 """
+
+# context: upstream-stated where it exists (see above), otherwise measured.
+# vision:  two-image control.  max_output: unverified hint.
 MODELS = {
-    "big-pickle": {"protocol": "chat", "context": 1048576},
-    "space-bunny-free": {"protocol": "chat", "context": 1048576},
-    "longcat-2.5-preview-free": {"protocol": "chat", "context": 200000},
-    "mimo-v2.6-flash-free": {"protocol": "chat", "context": 200000},
-    "mimo-v2.5-free": {"protocol": "chat", "context": 200000},
-    "ling-3.0-flash-fin-free": {"protocol": "chat", "context": 200000},
-    "nemotron-3-ultra-free": {"protocol": "chat", "context": 200000},
-    "nemotron-3.5-lightning-free": {"protocol": "chat", "context": 200000},
-    "muse-spark-1.3-contributor-free": {"protocol": "responses", "context": 1048576},
-    "muse-spark-1.2-contributor-free": {"protocol": "responses", "context": 1048576},
+    "big-pickle": {
+        "protocol": "chat", "context": 1048576, "vision": True,
+        "reasoning": True, "tools": True, "max_output": 32000,
+    },
+    # context unconfirmed upstream (same bare "invalid request" as big-pickle)
+    "space-bunny-free": {
+        "protocol": "chat", "context": 1048576, "vision": True,
+        "reasoning": True, "tools": True, "max_output": 524288,
+    },
+    # upstream: "/max_tokens: 3000000 is not less or equal to 262144"
+    "longcat-2.5-preview-free": {
+        "protocol": "chat", "context": 262144, "vision": False,
+        "reasoning": True, "tools": True, "max_output": 262144,
+    },
+    # upstream: "maximum context length is 1048576 tokens"
+    "mimo-v2.6-flash-free": {
+        "protocol": "chat", "context": 1048576, "vision": True,
+        "reasoning": True, "tools": True, "max_output": 32000,
+    },
+    # upstream: "maximum context length is 1048576 tokens"
+    "mimo-v2.5-free": {
+        "protocol": "chat", "context": 1048576, "vision": True,
+        "reasoning": True, "tools": True, "max_output": 32000,
+    },
+    # upstream: "maximum context length is 262144 tokens"
+    "ling-3.0-flash-fin-free": {
+        "protocol": "chat", "context": 262144, "vision": False,
+        "reasoning": True, "tools": True, "max_output": 32768,
+    },
+    # upstream: "maximum context length is 1000000 tokens" (not 1048576)
+    "nemotron-3-ultra-free": {
+        "protocol": "chat", "context": 1000000, "vision": False,
+        "reasoning": True, "tools": True, "max_output": 128000,
+    },
+    # upstream: "maximum context length is 1000000 tokens" (not 1048576)
+    "nemotron-3.5-lightning-free": {
+        "protocol": "chat", "context": 1000000, "vision": False,
+        "reasoning": True, "tools": True, "max_output": 262144,
+    },
+    # vision re-measured with the two-image control: answers "gray" for every
+    # colour, so it reads no pixels
+    "muse-spark-1.3-contributor-free": {
+        "protocol": "responses", "context": 1048576, "vision": False,
+        "reasoning": True, "tools": True, "max_output": 131072,
+    },
+    # same as 1.3
+    "muse-spark-1.2-contributor-free": {
+        "protocol": "responses", "context": 1048576, "vision": False,
+        "reasoning": True, "tools": True, "max_output": 131072,
+    },
 }
 
 # Free ids that upstream no longer serves, kept out of MODELS on purpose so a
@@ -60,3 +134,67 @@ def responses_model_ids():
 def short_name(model):
     """Strip the `provider/model` and `model:tag` decorations clients add."""
     return str(model or "").split("/")[-1].split(":")[0]
+
+
+def model_info(model_id):
+    """Full advertised record for one id, as served on /v1/models.
+
+    Kept in one place so the catalog and the endpoint cannot disagree.
+
+    Zen's own /models is bare (id/object/created/owned_by and nothing else), so
+    the fields are emitted in the three shapes clients already parse rather
+    than one invented shape nobody reads:
+
+      * OpenAI      — id, object, created, owned_by (the baseline)
+      * models.dev  — `limit`, `modalities`, `reasoning`, `tool_call`, `cost`.
+                      read by opencode and by hermes' agent/models_dev.py
+                      (_parse_model_info), which is where context_window and
+                      vision support come from for those clients.
+      * OpenRouter  — `supported_parameters`, `context_length`,
+                      `architecture.input_modalities`, `top_provider`. read by
+                      hermes' parse_openrouter_reasoning_capabilities, which
+                      decides "supports reasoning" from the presence of
+                      "reasoning" in supported_parameters and nothing else.
+
+    Reasoning effort levels are deliberately absent: they are not published
+    upstream and were not measured, so a client that needs them still has to
+    probe. A missing `reasoning` object reads as "supports reasoning, efforts
+    unknown", which is the truth.
+    """
+    m = MODELS[model_id]
+    context, output = m["context"], m["max_output"]
+    vision, reasoning, tools = m["vision"], m["reasoning"], m["tools"]
+    input_modalities = ["text"] + (["image"] if vision else [])
+    params = ["max_tokens", "temperature", "top_p", "stop", "stream"]
+    if tools:
+        params += ["tools", "tool_choice", "parallel_tool_calls"]
+    if reasoning:
+        params.append("reasoning")
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,          # not published upstream; keeps strict parsers happy
+        "owned_by": "opencode-zen",
+        "name": model_id,
+        # what this proxy has always served, plus a dict-of-bools `capabilities`
+        # matching hermes' provider-level capabilities shape
+        "context_window": context,
+        "capabilities": {"vision": vision, "reasoning": reasoning, "tools": tools},
+        "limits": {"context": context, "output": output},
+        # models.dev
+        "limit": {"context": context, "output": output},
+        "modalities": {"input": input_modalities, "output": ["text"]},
+        "reasoning": reasoning,
+        "tool_call": tools,
+        "attachment": vision,
+        "cost": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        # OpenRouter
+        "supported_parameters": params,
+        "context_length": context,
+        "architecture": {"input_modalities": input_modalities,
+                         "output_modalities": ["text"],
+                         "modality": f"text+{'image->' if vision else ''}text"},
+        "top_provider": {"context_length": context,
+                         "max_completion_tokens": output,
+                         "is_moderated": False},
+    }
