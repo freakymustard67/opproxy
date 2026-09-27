@@ -20,12 +20,16 @@ Verified fingerprint (no API key, see zen_free.py):
 """
 import json
 import os
+import re
 import secrets
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from zen_models import MODELS, chat_model_ids, responses_model_ids, short_name
+
 
 UPSTREAM = os.environ.get("OPENCODE_ZEN_URL", "https://opencode.ai/zen/v1")
 ZEN_KEY = os.environ.get("ZEN_KEY") or os.environ.get("OPENCODE_API_KEY") or "public"
@@ -37,27 +41,12 @@ FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "big-pickle")
 
 ses_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-# Free models w/ upstream protocol + verified-ish limits (models.dev + akashdeep probes).
-# chat -> /chat/completions | responses -> /responses | messages -> /messages
-MODELS = {
-    "big-pickle": {"protocol": "chat", "context": 1048576},
-    "space-bunny-free": {"protocol": "chat", "context": 1048576},
-    "longcat-2.5-preview-free": {"protocol": "chat", "context": 200000},
-    "mimo-v2.6-flash-free": {"protocol": "chat", "context": 200000},
-    "mimo-v2.5-free": {"protocol": "chat", "context": 200000},
-    "mimo-v2-pro-free": {"protocol": "chat", "context": 200000},
-    "ling-3.0-flash-fin-free": {"protocol": "chat", "context": 200000},
-    "nemotron-3-ultra-free": {"protocol": "chat", "context": 200000},
-    "nemotron-3.5-lightning-free": {"protocol": "chat", "context": 200000},
-    "deepseek-v4-flash-free": {"protocol": "chat", "context": 1048576},
-    "kimi-k2.5-free": {"protocol": "chat", "context": 200000},
-    "glm-5-free": {"protocol": "chat", "context": 200000},
-    "qwen3.6-plus-free": {"protocol": "messages", "context": 200000},
-    "minimax-m2.5-free": {"protocol": "messages", "context": 200000},
-    "minimax-m3-free": {"protocol": "messages", "context": 200000},
-    "muse-spark-1.3-contributor-free": {"protocol": "responses", "context": 1048576},
-    "muse-spark-1.2-contributor-free": {"protocol": "responses", "context": 1048576},
-}
+# Free models live in zen_models.py (single source of truth, probed against
+# upstream). Upstream protocol families: chat -> /chat/completions,
+# responses -> /responses. /v1/messages is a native Anthropic passthrough and
+# serves whichever catalog model accepts that wire format, so it is not a
+# model family of its own.
+
 
 DUMMY_CHAT_TOOLS = [
     {"type": "function", "function": {"name": "read", "description": "Read a file", "parameters": {"type": "object", "properties": {}}}},
@@ -72,6 +61,21 @@ DUMMY_ANT_TOOLS = [
     {"name": "shell", "description": "Run a shell command", "input_schema": {"type": "object", "properties": {}}},
 ]
 DUMMY_NAMES = {"read", "shell", "bash"}
+
+SES_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+
+
+def _deep_stats():
+    """Snapshot counters with the nested dicts *copied*, not shared: /status
+    serializes outside the lock, and a stat() landing mid-dumps would raise
+    "dictionary changed size during iteration"."""
+    return {"requests_total": _stats["requests_total"],
+            "by_model": dict(_stats["by_model"]),
+            "by_status": dict(_stats["by_status"]),
+            "rate_limited": _stats["rate_limited"],
+            "fallback_used": _stats["fallback_used"],
+            "started": _stats["started"]}
+
 
 _stats_lock = threading.Lock()
 _stats = {"requests_total": 0, "by_model": {}, "by_status": {}, "rate_limited": 0,
@@ -98,7 +102,7 @@ _sessions, _sessions_lock = {}, threading.Lock()  # per-client-IP sticky ses, 30
 
 
 def session_for(client_ip, provided):
-    if provided and provided.startswith("ses_") and len(provided) == 30:
+    if provided and SES_RE.match(provided):
         return provided
     now = time.time()
     with _sessions_lock:
@@ -168,6 +172,12 @@ def upstream_post(path, payload, ses, stream_want):
         return resp.status, resp, None
     except urllib.error.HTTPError as e:
         return e.code, None, e.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        # Connection refused / DNS / TLS / read timeout. Unhandled, the
+        # exception killed the request with no response at all (client saw a
+        # socket reset); report it as an upstream failure instead.
+        return 502, None, json.dumps({"error": {"type": "upstream_unavailable",
+                                               "message": str(e)[:200]}}).encode()
 
 
 class H(BaseHTTPRequestHandler):
@@ -215,7 +225,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"status": "ok"})
         if self.path == "/status":
             with _stats_lock:
-                s = dict(_stats, uptime=int(time.time() - _stats["started"]))
+                s = _deep_stats()
+            s["uptime"] = int(time.time() - s.pop("started"))
             return self._send(200, s)
         if self.path in ("/v1/models", "/v1/models/"):
             data = [{"id": m, "object": "model", "owned_by": "opencode-zen",
@@ -240,7 +251,7 @@ class H(BaseHTTPRequestHandler):
     # ---- /v1/chat/completions (OpenAI-compatible) ----
     def handle_chat(self, body):
         model = body.get("model", "")
-        short = model.split("/")[-1].split(":")[0]
+        short = short_name(model)
         if short not in MODELS:
             # paid-model gate (akashdeep 422) + fallback (usa-w x-model-fallback)
             if FALLBACK_MODEL in MODELS:
@@ -251,7 +262,7 @@ class H(BaseHTTPRequestHandler):
                 fallback_hdr = {"x-model-fallback": f"{model} -> {short}"}
             else:
                 stat(model, 422)
-                return self._send(422, {"error": f"unknown/free model only: {sorted(MODELS)}"})
+                return self._send(422, {"error": f"unknown/free model only: {chat_model_ids()}"})
         else:
             fallback_hdr = {}
         if MODELS[short]["protocol"] == "responses":
@@ -348,11 +359,11 @@ class H(BaseHTTPRequestHandler):
     # ---- /v1/responses (OpenAI Responses) ----
     def handle_responses(self, body):
         model = body.get("model", "")
-        short = model.split("/")[-1].split(":")[0]
+        short = short_name(model)
         if short not in MODELS or MODELS[short]["protocol"] != "responses":
             stat(model, 422)
             return self._send(422, {"error": f"responses model required, free: "
-                                             f"{[m for m, v in MODELS.items() if v['protocol'] == 'responses']}"})
+                                             f"{responses_model_ids()}"})
         client_stream = body.get("stream", False)
         up = dict(body, model=short, store=False, stream=True,
                   tools=ensure_resp_tools(body.get("tools")))
@@ -422,7 +433,7 @@ class H(BaseHTTPRequestHandler):
     # ---- /v1/messages (Anthropic native passthrough, beta) ----
     def handle_messages(self, body):
         model = body.get("model", "")
-        short = model.split("/")[-1].split(":")[0]
+        short = short_name(model)
         if short not in MODELS:
             stat(model, 422)
             return self._send(422, {"error": f"free models only: {sorted(MODELS)}"})
