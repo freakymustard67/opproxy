@@ -10,17 +10,27 @@ from inside the OpenCode client. `opproxy` applies that fingerprint to every
 upstream request:
 
 * `Authorization: Bearer public` (or `ZEN_KEY`/`OPENCODE_API_KEY` if set)
-* `User-Agent: opencode/latest/2.0.18/cli` (override with `OPENCODE_UA`)
-* Fresh valid `x-opencode-session: ses_…` per client (sticky 30 min per
-  client IP, reused if the client already sends one)
-* `x-opencode-client: cli`, `x-opencode-project: global`
+* `User-Agent: opencode/latest/2.0.14/cli` (override with `OPENCODE_UA`)
+* `x-opencode-session` + `x-session-affinity` + `X-Session-Id`, all set to the
+  same sha256-derived `ses_<12hex><14base62>` id. A session the client already
+  sends (under any of those three headers) is reused, so its stickiness
+  survives; otherwise one is kept per client IP for 30 minutes.
+* `x-opencode-client: cli` and `x-opencode-project: <32-hex>`, the latter from
+  `OPENCODE_SPOOF_PROJECT_ID` or `~/.omp/install-id`, omitted when unavailable
 * `stream: true` forced upstream (`store: false` on `/v1/responses`,
   `stream_options: {"include_usage": true}` on chat)
-* `tools` always include `read` + `shell` dummies (per-protocol format).
+* `tools` always include `read` + `bash` dummies (per-protocol format).
   Without them Zen returns
   `403 FreeTierError: ... only ... within OpenCode`.
-  Dummy calls are stripped from responses on all three protocols, streaming
+* For OpenAI Python SDK clients, `web_search`/`search_files` are aliased to
+  `hermes_web_search`/`hermes_search_files` and a `strict` key is dropped —
+  Zen reserves those names server-side. Other clients (omp) pass through
+  untouched.
+* Dummy calls are stripped from responses on all three protocols, streaming
   included, so a tool-using client never tries to execute them.
+
+Fingerprint values are ported from `~/omp-zen-proxy/main.ts`, the
+implementation verified working against the live gate.
 
 ## Endpoints
 
@@ -58,7 +68,8 @@ Unknown/paid chat models fall back to `big-pickle` with an
 ## Run
 
 ```bash
-python3 opproxy.py                  # :8787, anonymous
+./start.sh                           # :8787, backgrounded + verified
+python3 opproxy.py                  # :8787, anonymous, foreground
 PORT=8080 PROXY_TOKEN=secret python3 opproxy.py
 ZEN_KEY=sk-... python3 opproxy.py   # BYOK instead of public
 UPSTREAM_PROXY=http://user:pass@host:3128 python3 opproxy.py  # rotating egress
@@ -74,6 +85,7 @@ OPENCODE_ZEN_URL=https://opencode.ai/zen/v1 python3 opproxy.py
 | `OPENCODE_UA` | `opencode/latest/2.0.18/cli` | Upstream User-Agent |
 | `UPSTREAM_PROXY` | _(direct)_ | `http(s)://` proxy for upstream egress |
 | `FALLBACK_MODEL` | `big-pickle` | Fallback for unknown chat models (empty disables) |
+| `OPENCODE_SPOOF_PROJECT_ID` | `~/.omp/install-id` | 32-hex `x-opencode-project` value |
 
 ## Use with harnesses
 
@@ -144,24 +156,6 @@ the `400` cross-protocol hint, and moves on.
 
 `zen_free.py` is the minimal standalone client proving the gate
 (`chat` and `responses` modes, no proxy needed).
-
-## General-purpose proxy (`opproxy_general.py`)
-
-Same fingerprint, but for plain clients like a study summarizer that send
-no tools and/or `stream:false`:
-
-```bash
-python3 opproxy_general.py  # :8788
-```
-
-* `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`.
-* No-tool requests get gate dummies + `tool_choice:none` upstream, are
-  aggregated with retries (the model nondeterministically calls the dummy
-  tools ~1/3 of the time), and dummy-only results are reported as
-  `finish_reason:stop`.
-* Streaming responses are re-emitted clean: no `reasoning_content`/`name`
-  fields, no dummy `tool_calls`, no `cost` trailer.
-* Requests that already carry tools pass through (streaming sanitized).
 
 ## Limits
 
