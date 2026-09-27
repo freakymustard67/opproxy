@@ -151,7 +151,7 @@ def ensure_ant_tools(tools):
     return tools
 
 
-def upstream_post(path, payload, ses, stream_want):
+def upstream_post(path, payload, ses, stream_want, extra_headers=None):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(UPSTREAM + path, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -161,6 +161,8 @@ def upstream_post(path, payload, ses, stream_want):
     req.add_header("x-opencode-project", "global")
     req.add_header("x-opencode-session", ses)
     req.add_header("Accept", "text/event-stream" if stream_want else "application/json")
+    for k, v in (extra_headers or {}).items():
+        req.add_header(k, v)
     kw = {}
     if UPSTREAM_PROXY:  # v6pool-style rotation (akashdeep)
         kw["proxies"] = {"https": UPSTREAM_PROXY, "http": UPSTREAM_PROXY}
@@ -202,7 +204,9 @@ class H(BaseHTTPRequestHandler):
     def _auth_ok(self):
         if not PROXY_TOKEN:
             return True
-        got = self.headers.get("Authorization", "")
+        # Anthropic clients (and hermes in anthropic_messages mode) send
+        # x-api-key; OpenAI clients send Authorization: Bearer.
+        got = self.headers.get("Authorization") or self.headers.get("x-api-key") or ""
         if got.startswith("Bearer "):
             got = got[7:]
         return secrets.compare_digest(got, PROXY_TOKEN)
@@ -436,43 +440,92 @@ class H(BaseHTTPRequestHandler):
         short = short_name(model)
         if short not in MODELS:
             stat(model, 422)
-            return self._send(422, {"error": f"free models only: {sorted(MODELS)}"})
-        body = dict(body, model=short)
-        if isinstance(body.get("tools"), list):
-            body["tools"] = ensure_ant_tools(body["tools"])
-        else:
-            body["tools"] = ensure_ant_tools([])
-        if "max_tokens" not in body:
-            body["max_tokens"] = 1024
+            return self._send(422, {"error": f"free models only: {chat_model_ids()}"})
+        client_stream = bool(body.get("stream", False))
+        up = dict(body, model=short, stream=client_stream,
+                  tools=ensure_ant_tools(body.get("tools")))
+        up.setdefault("max_tokens", 1024)
         ses = session_for(self.client_address[0], self.headers.get("x-opencode-session"))
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(UPSTREAM + "/messages", data=data, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", f"Bearer {ZEN_KEY}")
-        req.add_header("User-Agent", UA)
-        req.add_header("x-opencode-client", "cli")
-        req.add_header("x-opencode-project", "global")
-        req.add_header("x-opencode-session", ses)
-        req.add_header("anthropic-version", self.headers.get("anthropic-version", "2023-06-01"))
-        try:
-            resp = urllib.request.urlopen(req, timeout=120)
-            raw = resp.read()
-            stat(short, 200)
+        status, resp, err = upstream_post("/messages", up, ses, client_stream, {
+            "anthropic-version": self.headers.get("anthropic-version", "2023-06-01"),
+        })
+        if err is not None:
+            stat(short, status)
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        except urllib.error.HTTPError as e:
-            eb = e.read()
-            stat(short, e.code)
-            try:
-                self._send(e.code, json.loads(eb.decode()))
+                return self._send(status, json.loads(err.decode()))
             except ValueError:
-                self._send(e.code, {"error": "upstream error"})
+                return self._send(status, {"error": "upstream error"})
+        try:
+            if client_stream:
+                self._stream_messages(resp, short)
+            else:
+                self._json_messages(resp, short)
+        finally:
+            resp.close()
+
+    def _json_messages(self, resp, short):
+        """Non-streaming: strip the gate dummy tool_use blocks Zen echoes back."""
+        try:
+            msg = json.loads(resp.read().decode(errors="replace"))
+        except ValueError:
+            stat(short, 502)
+            return self._send(502, {"error": "upstream sent a non-JSON body"})
+        if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+            kept = [b for b in msg["content"]
+                    if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                            and b.get("name") in DUMMY_NAMES)]
+            if len(kept) != len(msg["content"]):
+                msg["content"] = kept
+                if msg.get("stop_reason") == "tool_use" and not any(
+                        b.get("type") == "tool_use" for b in kept):
+                    msg["stop_reason"] = "end_turn"
+        stat(short, 200)
+        return self._send(200, msg)
+
+    def _stream_messages(self, resp, short):
+        """Streaming: relay the Anthropic event stream, dropping whole dummy
+        tool_use blocks (start + deltas + stop) so a gate dummy never reaches
+        the client as a real tool invocation."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        dummy_idx, real_tool_use, broken = set(), False, False
+        for raw_line in resp:
+            if broken:
+                break
+            line = raw_line.decode(errors="replace").rstrip("\r\n")
+            if not line.startswith("data:"):
+                out = line + "\n"          # event:/ping/keep-alive pass through
+            else:
+                try:
+                    data = json.loads(line[5:].strip() or "{}")
+                except ValueError:
+                    out = line + "\n"
+                    data = None
+                if data is not None:
+                    kind = data.get("type")
+                    if kind == "content_block_start":
+                        block = data.get("content_block") or {}
+                        if block.get("type") == "tool_use":
+                            if block.get("name") in DUMMY_NAMES:
+                                dummy_idx.add(data.get("index"))
+                                continue
+                            real_tool_use = True
+                    elif kind in ("content_block_delta", "content_block_stop"):
+                        if data.get("index") in dummy_idx:
+                            continue
+                    elif kind == "message_delta":
+                        delta = data.get("delta") or {}
+                        if delta.get("stop_reason") == "tool_use" and not real_tool_use:
+                            data = dict(data, delta=dict(delta, stop_reason="end_turn"))
+                    out = f"data: {json.dumps(data)}\n\n"
+            try:
+                self.wfile.write(out.encode())
+            except (BrokenPipeError, ConnectionResetError):
+                broken = True
+        stat(short, 200)
 
 
 if __name__ == "__main__":
