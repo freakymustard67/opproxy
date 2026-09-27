@@ -107,6 +107,24 @@ Verified with `omp` (plain reply + file-write task) and `hermes`
 `zen_free.py` is the minimal standalone client proving the gate
 (`chat` and `responses` modes, no proxy needed).
 
+## General-purpose proxy (`opproxy_general.py`)
+
+Same fingerprint, but for plain clients like a study summarizer that send
+no tools and/or `stream:false`:
+
+```bash
+python3 opproxy_general.py  # :8788
+```
+
+* `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`.
+* No-tool requests get gate dummies + `tool_choice:none` upstream, are
+  aggregated with retries (the model nondeterministically calls the dummy
+  tools ~1/3 of the time), and dummy-only results are reported as
+  `finish_reason:stop`.
+* Streaming responses are re-emitted clean: no `reasoning_content`/`name`
+  fields, no dummy `tool_calls`, no `cost` trailer.
+* Requests that already carry tools pass through (streaming sanitized).
+
 ## Limits
 
 * Streaming upstream is mandatory; non-streaming is emulated by aggregation.
